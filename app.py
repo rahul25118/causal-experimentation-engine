@@ -17,8 +17,6 @@ if not Path(DATA_PATH).exists():
     with st.spinner("Generating 1,000,000-row A/B dataset..."):
         generate_ab_dataset(n_users=1_000_000, output_path=DATA_PATH)
 
-con = duckdb.connect()
-
 # Sidebar Filters
 st.sidebar.header("Experiment Controls")
 selected_device = st.sidebar.multiselect("Device Filter", ["Android", "iOS", "Web"], default=["Android", "iOS", "Web"])
@@ -29,16 +27,14 @@ if not selected_device or not selected_tier:
     st.warning("Please select at least one Device and City Tier.")
     st.stop()
 
-dev_sql = ",".join([f"'{d}'" for d in selected_device])
-tier_sql = ",".join([f"'{t}'" for t in selected_tier])
-
-filtered_df = con.execute(
-    f"""
-    SELECT variant, pre_metric, post_metric, device, city_tier
-    FROM '{DATA_PATH}'
-    WHERE device IN ({dev_sql}) AND city_tier IN ({tier_sql})
-    """
-).pl()
+# Native Polars predicate pushdown on 1M-row Parquet (no pyarrow bridge needed)
+filtered_df = (
+    pl.scan_parquet(DATA_PATH)
+    .filter(
+        pl.col("device").is_in(selected_device) & pl.col("city_tier").is_in(selected_tier)
+    )
+    .collect()
+)
 
 v = filtered_df["variant"].to_numpy()
 y_post = filtered_df["post_metric"].to_numpy()
@@ -62,7 +58,11 @@ k2.metric("CUPED ATE (Lift)", f"{cuped_res['ate']:.4f}", f"Naive: {naive_res['at
 k3.metric("Variance Reduction", f"{var_red:.2f}%", f"theta = {theta:.3f}")
 k4.metric("Always-Valid p-value", f"{av_p:.2e}", "Significant" if av_p < 0.05 else "Inconclusive")
 
-st.subheader("Segment-Level Uplift Summary (DuckDB Aggregation)")
+st.subheader("Segment-Level Uplift Summary (DuckDB SQL Aggregation)")
+dev_sql = ",".join([f"'{d}'" for d in selected_device])
+tier_sql = ",".join([f"'{t}'" for t in selected_tier])
+
+con = duckdb.connect()
 seg_table = con.execute(
     f"""
     SELECT
